@@ -254,6 +254,18 @@ SQL Injection detected
 
 ---
 
+### response  of the code must be 
+
+```json
+[
+    {
+        'type': 'SQL Injection',
+        'line': 6,
+        'severity': 'HIGH'
+    }
+]
+```
+
 # ⚠️ False Positives & False Negatives
 
 ## ❌ False Positive
