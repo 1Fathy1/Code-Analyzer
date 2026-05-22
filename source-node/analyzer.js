@@ -1,21 +1,18 @@
+const express = require("express");
 const esprima = require("esprima");
+const app = express();
 
-/**
- * 🧪 Test Case: يمكنك تغيير الكود هنا لاختبار حالات مختلفة
- * الحالة الحالية تشمل: استعلام آمن (Parameterized) واستعلامات خطرة و XSS و CMD و Exposure و CSRF
- */
-const codeToScan = `
-query = build_query(x)
+app.use(express.json());
 
-cursor.execute(query)
-`;
+// مصفوفة بكل الأنواع المتاحة للفحص عند اختيار "Select All"
+const AVAILABLE_MODES = ["sql", "xss", "cmd", "exposure", "csrf"];
 
 function analysis(code, mode) {
   let tree;
   try {
     tree = esprima.parseScript(code, { loc: true });
   } catch (e) {
-    return [];
+    return []; // كود غير صحيح قواعدياً
   }
 
   let findings = [];
@@ -30,76 +27,71 @@ function analysis(code, mode) {
     exposure: ["log", "print", "warn"],
   };
 
-  // فحص شامل لوجود أي حماية CSRF في الملف
   const codeString = code.toLowerCase();
-  if (
-    codeString.includes("csurf") ||
-    codeString.includes("csrf") ||
-    codeString.includes("antiforgery")
-  ) {
+  if (codeString.includes("csurf") || codeString.includes("csrf") || codeString.includes("antiforgery")) {
     hasCsrfProtection = true;
   }
 
+  // دالة مساعدة لتتبع التلوث
+  function isNodeTainted(node) {
+    if (!node) return false;
+    if (node.type === "Identifier") return taintedVariables.has(node.name);
+    if (node.type === "BinaryExpression") {
+      return isNodeTainted(node.left) || isNodeTainted(node.right);
+    }
+    if (node.type === "CallExpression") {
+      const name = node.callee.name || (node.callee.property ? node.callee.property.name : "");
+      if (name === "input" || name === "req.body" || name === "req.query") return true;
+      return node.arguments.some((arg) => isNodeTainted(arg));
+    }
+    return false;
+  }
+
+  // الفحص العابر للـ AST
   tree.body.forEach((node) => {
-    // --- 1. تتبع التلوث (Taint Analysis) ---
-    if (
-      node.type === "ExpressionStatement" &&
-      node.expression.type === "AssignmentExpression"
-    ) {
+    if (node.type === "ExpressionStatement" && node.expression.type === "AssignmentExpression") {
       const assign = node.expression;
       if (assign.left.type === "Identifier") {
-        const varName = assign.left.name;
-        if (isNodeTainted(assign.right, taintedVariables)) {
-          taintedVariables.add(varName);
+        if (isNodeTainted(assign.right)) {
+          taintedVariables.add(assign.left.name);
         }
       }
     }
 
-    // --- 2. فحص العمليات الخطرة (Sinks) ---
-    if (
-      node.type === "ExpressionStatement" &&
-      node.expression.type === "CallExpression"
-    ) {
+    if (node.type === "ExpressionStatement" && node.expression.type === "CallExpression") {
       const call = node.expression;
-      const methodName =
-        call.callee.name ||
-        (call.callee.property ? call.callee.property.name : "");
+      const methodName = call.callee.name || (call.callee.property ? call.callee.property.name : "");
 
-      // فحص SQL, XSS, Command Injection
+      // 1. SQL, XSS, CMD
       if (sinks[mode] && sinks[mode].includes(methodName)) {
-        // حل الـ False Positive للـ SQL: لو مبعوت أكتر من Argument يبقى Parameterized (آمن)
-        if (mode === "sql" && call.arguments.length > 1) return;
+        if (mode === "sql" && call.arguments.length > 1) return; // Parameterized = safe
 
-        call.arguments.forEach((arg) => {
-          if (isNodeTainted(arg, taintedVariables)) {
-            findings.push({
-              type:
-                mode === "sql"
-                  ? "SQL Injection"
-                  : mode === "xss"
-                    ? "XSS"
-                    : "Command Injection",
-              line: node.loc.start.line,
-              severity: "HIGH",
-            });
-          }
-        });
+        let isVulnerable = call.arguments.some((arg) => isNodeTainted(arg));
+        if (isVulnerable) {
+          findings.push({
+            type: mode === "sql" ? "SQL Injection" : mode === "xss" ? "XSS" : "Command Injection",
+            line: node.loc.start.line,
+            severity: "HIGH",
+          });
+        }
       }
 
-      // فحص Data Exposure
+      // 2. Data Exposure
       if (mode === "exposure" && sinks["exposure"].includes(methodName)) {
-        call.arguments.forEach((arg) => {
-          if (hasSensitiveName(arg, sensitivePatterns)) {
-            findings.push({
-              type: "Data Exposure",
-              line: node.loc.start.line,
-              severity: "MEDIUM",
-            });
-          }
+        let isSensitive = call.arguments.some((arg) => {
+          if (arg.type === "Identifier") return sensitivePatterns.test(arg.name);
+          return false;
         });
+        if (isSensitive) {
+          findings.push({
+            type: "Data Exposure",
+            line: node.loc.start.line,
+            severity: "MEDIUM",
+          });
+        }
       }
 
-      // فحص CSRF
+      // 3. CSRF
       if (mode === "csrf" && (methodName === "post" || methodName === "put")) {
         if (!hasCsrfProtection) {
           findings.push({
@@ -111,53 +103,32 @@ function analysis(code, mode) {
       }
     }
   });
+
   return findings;
 }
 
-// دالة مساعدة لتتبع مصدر البيانات (هل هي من input؟)
-function isNodeTainted(node, taintedSet) {
-  if (!node) return false;
+// الـ Endpoint المطلوبة للفرونت والباك
+app.post("/analyze", (req, res) => {
+  const { lan, code, vuln } = req.body;
 
-  // 1. لو متغير: بنشوف هل هو في قائمة الملوثين (taintedSet)
-  if (node.type === "Identifier") return taintedSet.has(node.name);
-
-  // 2. لو عملية جمع (+): بنشوف لو أي طرف من الطرفين ملوث
-  if (node.type === "BinaryExpression") {
-    return isNodeTainted(node.left, taintedSet) || isNodeTainted(node.right, taintedSet);
+  if (lan !== "node" && lan !== "javascript") {
+    return res.status(400).json({ error: "This endpoint only supports Node.js/Javascript" });
   }
 
-  // 3. التعديل المهم: لو مناداة دالة (CallExpression)
-  if (node.type === "CallExpression") {
-    const name = node.callee.name || (node.callee.property ? node.callee.property.name : "");
-    
-    // أ: لو الدالة هي input() فده المصدر الأصلي للتلوث
-    if (name === "input") return true;
+  let finalResults = [];
 
-    // ب: لو دالة وسيطة (زي build_query)، بنشيك على الـ arguments بتاعتها
-    // لو أي argument ملوث، بنعتبر نتيجة الدالة ملوثة (Taint Propagation)
-    return node.arguments.some((arg) => isNodeTainted(arg, taintedSet));
+  // التعديل الذكي لدعم الـ Select All وثغرة معينة في نفس الوقت
+  if (vuln === "all") {
+    // لو اختار Select All بنلف على كل المودز ونجمع النتائج
+    AVAILABLE_MODES.forEach((mode) => {
+      finalResults = finalResults.concat(analysis(code, mode));
+    });
+  } else {
+    // لو اختار ثغرة واحدة معينة بنشغل الـ analysis عليها هي بس
+    finalResults = analysis(code, vuln);
   }
 
-  return false;
-}
-
-// دالة مساعدة لفحص الأسماء الحساسة (للـ Data Exposure)
-function hasSensitiveName(node, pattern) {
-  if (node.type === "Identifier") return pattern.test(node.name);
-  if (node.type === "BinaryExpression")
-    return (
-      hasSensitiveName(node.left, pattern) ||
-      hasSensitiveName(node.right, pattern)
-    );
-  return false;
-}
-
-// تشغيل المحرك على كافة الأنماط وتجميع النتائج
-const modes = ["sql", "xss", "cmd", "exposure", "csrf"];
-let allFindings = [];
-modes.forEach((m) => {
-  allFindings = allFindings.concat(analysis(codeToScan, m));
+  return res.json(finalResults);
 });
 
-// طباعة النتيجة النهائية كـ JSON (المطلوب للمشروع)
-console.log(JSON.stringify(allFindings, null, 4));
+app.listen(3000, () => console.log("Node.js Code Review Service running on port 3000"));
