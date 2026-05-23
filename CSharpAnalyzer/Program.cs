@@ -1,226 +1,124 @@
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.DependencyInjection; //  كدا مضبوطة 100%
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 
-var builder = WebApplication.CreateBuilder(args);
-
-// إضافة خدمات الـ Controllers ودعم الـ CORS عشان الفرونت إند يعرف يكلم الباك إند
-builder.Services.AddControllers();
-builder.Services.AddCors(options =>
+public class AwareXCSharpAnalyzer
 {
-    options.AddDefaultPolicy(policy => policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
-});
-
-var app = builder.Build();
-
-app.UseCors();
-app.MapControllers();
-
-// تشغيل السيرفر على بورت 3000 عشان يتوافق مع ريكويست الفرونت إند
-app.Run("http://localhost:3000");
-
-namespace CSharpAnalyzer
-{
-    [ApiController]
-    [Route("api/analyze")]
-    public class AnalyzeController : ControllerBase
+    private class SecurityWalker : CSharpSyntaxWalker
     {
-        [HttpPost]
-        public IActionResult Analyze([FromBody] AnalyzeRequest request)
+        public List<Dictionary<string, string>> Findings = new List<Dictionary<string, string>>();
+        private string _mode;
+        private HashSet<string> _taintedVars = new HashSet<string>();
+        private bool _hasCsrfAttribute = false;
+
+        public SecurityWalker(string mode) { _mode = mode.ToLower().Trim(); }
+
+        private bool IsExpressionTainted(ExpressionSyntax expression)
         {
-            if (string.IsNullOrEmpty(request.Code))
-            {
-                return Content("[]", "text/plain", Encoding.UTF8);
-            }
-
-            // تشغيل الفحص الذكي (لو مبعوتش نوع ثغرة هيفحص الكل "all")
-            var rawFindings = Analyzer.Analysis(request.Code, request.Vuln ?? "all");
-            
-            // تحويل النتيجة للفورمات الصارم المطلـوب بالـ Single Quotes
-            string finalResponse = Analyzer.FormatOutput(rawFindings);
-
-            // إرسال الرد كنص صريح (Text/Plain) للمحافظة التامة على المسافات وعلامات التنصيص
-            return Content(finalResponse, "text/plain", Encoding.UTF8);
-        }
-    }
-
-    public class AnalyzeRequest
-    {
-        public string? Lan { get; set; }
-        public string? Code { get; set; }
-        public string? Vuln { get; set; }
-    }
-
-    public class Finding
-    {
-        public string? Type { get; set; }
-        public int Line { get; set; }
-        public string? Severity { get; set; }
-    }
-
-    public static class Analyzer
-    {
-        private static readonly string[] AvailableModes = { "sql", "xss", "command", "csrf" };
-
-        public static List<Finding> Analysis(string code, string mode)
-        {
-            SyntaxTree tree = CSharpSyntaxTree.ParseText(code);
-            var root = tree.GetCompilationUnitRoot();
-            
-            var targetMode = mode.ToLower();
-            var allFindings = new List<Finding>();
-
-            if (targetMode == "all")
-            {
-                foreach (var m in AvailableModes)
-                {
-                    var walker = new SecurityWalker(m);
-                    walker.Visit(root);
-                    allFindings.AddRange(walker.Findings);
-                }
-            }
-            else
-            {
-                var walker = new SecurityWalker(targetMode);
-                walker.Visit(root);
-                allFindings.AddRange(walker.Findings);
-            }
-
-            // ترتيب الثغرات حسب السطور وحذف أي تكرار
-            return allFindings
-                .GroupBy(f => new { f.Type, f.Line })
-                .Select(g => g.First())
-                .OrderBy(f => f.Line)
-                .ToList();
-        }
-
-        // دالة التنسيق الاحترافية لطباعة الـ Single Quotes بالمسافات المطلوبة بالملّي
-        public static string FormatOutput(List<Finding> findings)
-        {
-            if (findings == null || findings.Count == 0) return "[]";
-
-            var sb = new StringBuilder();
-            sb.AppendLine("[");
-            for (int i = 0; i < findings.Count; i++)
-            {
-                var item = findings[i];
-                sb.AppendLine("    {");
-                sb.AppendLine($"        'type': '{item.Type}',");
-                sb.AppendLine($"        'line': {item.Line},");
-                sb.AppendLine($"        'severity': '{item.Severity}'");
-                sb.Append("    }");
-                if (i < findings.Count - 1) sb.AppendLine(",");
-                else sb.AppendLine();
-            }
-            sb.Append("]");
-            return sb.ToString();
-        }
-    }
-
-    class SecurityWalker : CSharpSyntaxWalker
-    {
-        public List<Finding> Findings { get; } = new();
-        private readonly string mode;
-        private readonly HashSet<string> taintedVars = new();
-
-        public SecurityWalker(string mode) => this.mode = mode;
-
-        private bool IsNodeTainted(SyntaxNode? node)
-        {
-            if (node == null) return false;
-            string nodeStr = node.ToString();
-
-            // مصادر التلوث الصريحة في دوت نت لحماية الـ False Negatives
-            if (nodeStr.Contains("ReadLine") || nodeStr.Contains("Request.Query") || 
-                nodeStr.Contains("Request.Form") || nodeStr.Contains("Request.Headers") || nodeStr.Contains("input"))
-            {
-                return true;
-            }
-
-            if (node is IdentifierNameSyntax idNode && taintedVars.Contains(idNode.Identifier.Text))
-            {
-                return true;
-            }
-
-            return node.ChildNodes().Any(IsNodeTainted);
+            if (expression is IdentifierNameSyntax identifier && _taintedVars.Contains(identifier.Identifier.Text)) return true;
+            if (expression is InvocationExpressionSyntax invocation && invocation.ToString().Contains("Console.ReadLine")) return true;
+            if (expression is BinaryExpressionSyntax binary && (IsExpressionTainted(binary.Left) || IsExpressionTainted(binary.Right))) return true;
+            if (expression is InterpolatedStringExpressionSyntax) return true; // كشف الـ String Interpolation $""
+            return false;
         }
 
         public override void VisitVariableDeclarator(VariableDeclaratorSyntax node)
         {
-            if (node.Initializer != null && IsNodeTainted(node.Initializer.Value))
+            if (node.Initializer != null && IsExpressionTainted(node.Initializer.Value))
             {
-                taintedVars.Add(node.Identifier.Text);
+                _taintedVars.Add(node.Identifier.Text); // تتبع انتقال التلوث للمتغير
             }
             base.VisitVariableDeclarator(node);
         }
 
-        public override void VisitAssignmentExpression(AssignmentExpressionSyntax node)
+        public override void VisitMethodDeclaration(MethodDeclarationSyntax node)
         {
-            if (IsNodeTainted(node.Right))
+            // فحص الـ CSRF: بنشوف لو الميثود عبارة عن HttpPost ومحمية بـ ValidateAntiForgeryToken
+            var attributes = node.AttributeLists.SelectMany(al => al.Attributes).Select(a => a.Name.ToString()).ToList();
+            if (attributes.Contains("HttpPost") && attributes.Contains("ValidateAntiForgeryToken"))
             {
-                taintedVars.Add(node.Left.ToString().Trim());
+                _hasCsrfAttribute = true;
             }
-            base.VisitAssignmentExpression(node);
+            base.VisitMethodDeclaration(node);
         }
 
         public override void VisitInvocationExpression(InvocationExpressionSyntax node)
         {
             string methodName = node.Expression.ToString();
 
-            if (mode == "sql")
+            // 1. فحص SQL Injection في دوت نت (SqlCommand, Dapper, Entity Framework Raw SQL)
+            if (_mode == "sql" && (methodName.Contains("ExecuteNonQuery") || methodName.Contains("FromSqlRaw") || methodName.Contains("Query")))
             {
-                bool isSqlSink = methodName.Contains("ExecuteNonQuery") || methodName.Contains("ExecuteReader") || 
-                                 methodName.Contains("ExecuteScalar") || methodName.EndsWith(".Query") || methodName.EndsWith(".Execute");
-
-                if (isSqlSink)
+                if (node.ArgumentList.Arguments.Count > 0 && IsExpressionTainted(node.ArgumentList.Arguments[0].Expression))
                 {
-                    bool hasTaintedArg = node.ArgumentList.Arguments.Any(arg => IsNodeTainted(arg.Expression));
-                    bool isParameterized = node.ArgumentList.ToString().Contains("@") || methodName.Contains("Parameters.Add");
-
-                    if (hasTaintedArg && !isParameterized) AddFinding("SQL Injection", node);
+                    AddFinding("SQL Injection", node.GetLocation().GetLineSpan().StartLinePosition.Line + 1, "CRITICAL");
                 }
             }
 
-            if (mode == "xss" && (methodName.Contains("Response.Write") || methodName.Contains("Html.Raw")))
+            // 2. فحص Command Injection (Process.Start)
+            if (_mode == "command" && methodName.Contains("Process.Start"))
             {
-                if (node.ArgumentList.Arguments.Any(arg => IsNodeTainted(arg.Expression))) AddFinding("XSS", node);
+                if (node.ArgumentList.Arguments.Count > 0 && IsExpressionTainted(node.ArgumentList.Arguments[0].Expression))
+                {
+                    AddFinding("Command Injection", node.GetLocation().GetLineSpan().StartLinePosition.Line + 1, "CRITICAL");
+                }
             }
 
-            if (mode == "command" && (methodName.Contains("Process.Start") || methodName.Contains("cmd.exe")))
+            // 3. فحص XSS (Html.Raw أو Response.Write الضعيفة في دوت نت)
+            if (_mode == "xss" && (methodName.Contains("Html.Raw") || methodName.Contains("Response.Write")))
             {
-                if (node.ArgumentList.Arguments.Any(arg => IsNodeTainted(arg.Expression))) AddFinding("Command Injection", node);
+                if (node.ArgumentList.Arguments.Count > 0 && IsExpressionTainted(node.ArgumentList.Arguments[0].Expression))
+                {
+                    AddFinding("Cross-Site Scripting (XSS)", node.GetLocation().GetLineSpan().StartLinePosition.Line + 1, "HIGH");
+                }
+            }
+
+            // 4. فحص Sensitive Data Exposure (MD5 / SHA1 في دوت نت)
+            if (_mode == "exposure" && (methodName.Contains("MD5.Create") || methodName.Contains("SHA1.Create")))
+            {
+                AddFinding("Sensitive Data Exposure (Weak Cryptography)", node.GetLocation().GetLineSpan().StartLinePosition.Line + 1, "MEDIUM");
             }
 
             base.VisitInvocationExpression(node);
         }
 
-        public override void VisitMethodDeclaration(MethodDeclarationSyntax node)
+        public void CheckFinalCsrf()
         {
-            if (mode == "csrf")
-            {
-                var attributes = node.AttributeLists.SelectMany(a => a.Attributes).Select(a => a.Name.ToString()).ToList();
-                bool isPost = attributes.Any(a => a.Contains("HttpPost") || a.Contains("HttpPut") || a.Contains("HttpDelete"));
-                bool hasCsrf = attributes.Any(a => a.Contains("ValidateAntiForgeryToken"));
-
-                if (isPost && !hasCsrf) AddFinding("CSRF (Missing Protection)", node);
-            }
-            base.VisitMethodDeclaration(node);
+            if (_mode == "csrf" && !_hasCsrfAttribute) AddFinding("Missing CSRF [ValidateAntiForgeryToken] Attribute", 1, "HIGH");
         }
 
-        private void AddFinding(string type, SyntaxNode node)
+        private void AddFinding(string type, int line, string severity)
         {
-            Findings.Add(new Finding
-            {
-                Type = type,
-                Line = node.GetLocation().GetLineSpan().StartLinePosition.Line + 1,
-                Severity = "HIGH"
-            });
+            Findings.Add(new Dictionary<string, string> { { "vulnerability", type }, { "line", line.ToString() }, { "severity", severity } });
+        }
+    }
+
+    // 🔥 الدالة المطلوبة: تستقبل كود اليوزر ونوع الثغرة ديناميكياً في السي شارب
+    public Dictionary<string, object> Analyze(string userCode, string userMode)
+    {
+        try
+        {
+            // تحويل كود اليوزر لـ Roslyn AST Tree
+            SyntaxTree tree = CSharpSyntaxTree.ParseText(userCode);
+            var root = tree.GetCompilationUnitRoot();
+
+            var walker = new SecurityWalker(userMode);
+            walker.Visit(root);
+            walker.CheckFinalCsrf(); // فحص الـ CSRF البعدي
+
+            return new Dictionary<string, object> {
+                { "status", "success" },
+                { "mode", userMode },
+                { "total_findings", walker.Findings.Count },
+                { "findings", walker.Findings }
+            };
+        }
+        catch (Exception ex)
+        {
+            return new Dictionary<string, object> { { "status", "error" }, { "message", ex.Message } };
         }
     }
 }
