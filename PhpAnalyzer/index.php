@@ -1,208 +1,119 @@
 <?php
-require 'vendor/autoload.php';
-
+use PhpParser\Error;
 use PhpParser\ParserFactory;
 use PhpParser\Node;
-use PhpParser\NodeTraverser;
 use PhpParser\NodeVisitorAbstract;
+use PhpParser\NodeTraverser;
 
-// تفعيل الـ CORS عشان الفرونت إند (React) يقدر يكلم السيرفر براحته
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type");
-
-// معالجة ريكويست الـ Preflight لـ CORS
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    exit(0);
-}
-
-// استقبال البيانات كـ JSON من الفرونت إند
-$input = json_decode(file_get_contents("php://input"), true);
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($input['code'])) {
-    $code = $input['code'];
-    $vuln = isset($input['vuln']) ? strtolower($input['vuln']) : 'all';
-
-    $rawFindings = phpAnalyze($code, $vuln);
-    $finalOutput = formatPhpOutput($rawFindings);
-
-    // الرد النصي الصارم المطلوب لتجنب مشاكل فك ترميز النصوص بالـ Single Quotes
-    header("Content-Type: text/plain; charset=utf-8");
-    echo $finalOutput;
-    exit;
-}
-
-// ========================================================
-// زائر شجرة الـ AST المخصص لتتبع تلوث الكود (Taint Analysis)
-// ========================================================
 class SecurityTaintVisitor extends NodeVisitorAbstract {
     public $findings = [];
     private $mode;
-    private $taintedVars = []; // مصفوفة لحفظ أسماء المتغيرات الملوثة
+    private $taintedVars = [];
+    private $hasCsrfCheck = false;
 
     public function __construct($mode) {
         $this->mode = $mode;
     }
 
-    // دالة تفحص لو العقدة تحتوي على مصدر تلوث أو متغير ملوث سابقاً
     private function isNodeTainted(Node $node) {
-        // 1. مصادر التلوث الصريحة في PHP (تغطية الـ False Negatives)
         if ($node instanceof Node\Expr\Variable) {
-            if (in_array($node->name, ['_GET', '_POST', '_REQUEST', '_COOKIE', '_FILES', 'input'])) {
-                return true;
-            }
-            if (isset($this->taintedVars[$node->name])) {
-                return true;
-            }
+            if (in_array($node->name, ['_GET', '_POST', '_REQUEST', '_COOKIE', '_FILES', 'input'])) return true;
+            if (isset($this->taintedVars[$node->name])) return true;
         }
-        
-        // فحص مصفوفات المدخلات مثل $_GET['id']
-        if ($node instanceof Node\Expr\ArrayDimFetch) {
-            return $this->isNodeTainted($node->var);
-        }
-
-        // فحص دمج النصوص عبر الـ Binary Expressions (. أو +)
-        if ($node instanceof Node\Expr\BinaryOp) {
-            return $this->isNodeTainted($node->left) || $this->isNodeTainted($node->right);
-        }
-
-        // فحص المتغيرات الممررة بداخل نصوص مزدوجة "SELECT * FROM users WHERE id = $id"
+        if ($node instanceof Node\Expr\ArrayDimFetch) return $this->isNodeTainted($node->var);
+        if ($node instanceof Node\Expr\BinaryOp) return $this->isNodeTainted($node->left) || $this->isNodeTainted($node->right);
         if ($node instanceof Node\Scalar\Encapsed) {
             foreach ($node->parts as $part) {
-                if ($part instanceof Node\Expr && $this->isNodeTainted($part)) {
-                    return true;
-                }
+                if ($part instanceof Node\Expr && $this->isNodeTainted($part)) return true;
             }
         }
-
         return false;
     }
 
     public function enterNode(Node $node) {
-        // 1. تتبع الإسناد (Assignment) مثل: $x = $_GET['id']; أو $y = $x;
+        // تتبع انتقال التلوث
         if ($node instanceof Node\Expr\Assign) {
-            if ($node->var instanceof Node\Expr\Variable) {
-                if ($this->isNodeTainted($node->expr)) {
-                    $this->taintedVars[$node->var->name] = true;
+            if ($node->var instanceof Node\Expr\Variable && $this->isNodeTainted($node->expr)) {
+                $this->taintedVars[$node->var->name] = true;
+            }
+        }
+
+        // كشف حماية الـ CSRF
+        if ($node instanceof Node\Expr\ArrayDimFetch) {
+            if ($node->var instanceof Node\Expr\Variable && $node->var->name === '_SESSION') {
+                if ($node->dim instanceof Node\Scalar\String_ && strpos(strtolower($node->dim->value), 'csrf') !== false) {
+                    $this->hasCsrfCheck = true; 
                 }
             }
         }
 
-        // 2. فحص استدعاء الدوال ومصادر الخطورة (Sinks)
-        if ($node instanceof Node\Expr\FuncCall) {
-            if ($node->name instanceof Node\Name) {
-                $funcName = $node->name->toString();
+        // فحص الـ Sinks (الدوال والميثودز)
+        if ($node instanceof Node\Expr\FuncCall && $node->name instanceof Node\Name) {
+            $funcName = $node->name->toString();
 
-                // فحص SQL Injection
-                if ($this->mode === 'sql' && in_array($funcName, ['mysqli_query', 'query', 'db_query', 'exec'])) {
-                    foreach ($node->args as $arg) {
-                        if ($this->isNodeTainted($arg->value)) {
-                            $this->findings[] = [
-                                'type' => 'SQL Injection',
-                                'line' => $node->getStartLine(),
-                                'severity' => 'HIGH'
-                            ];
-                            break;
-                        }
-                    }
-                }
-
-                // فحص Command Injection
-                if ($this->mode === 'command' && in_array($funcName, ['system', 'exec', 'shell_exec', 'passthru'])) {
-                    foreach ($node->args as $arg) {
-                        if ($this->isNodeTainted($arg->value)) {
-                            $this->findings[] = [
-                                'type' => 'Command Injection',
-                                'line' => $node->getStartLine(),
-                                'severity' => 'HIGH'
-                            ];
-                            break;
-                        }
-                    }
-                }
+            if ($this->mode === 'sql' && in_array($funcName, ['mysqli_query', 'query', 'db_query', 'exec'])) {
+                if ($this->isNodeTainted($node->args[0]->value)) $this->addFinding('SQL Injection', $node->getStartLine(), 'CRITICAL');
+            }
+            if ($this->mode === 'command' && in_array($funcName, ['system', 'exec', 'shell_exec', 'passthru'])) {
+                if ($this->isNodeTainted($node->args[0]->value)) $this->addFinding('Command Injection', $node->getStartLine(), 'CRITICAL');
+            }
+            if ($this->mode === 'exposure' && in_array($funcName, ['md5', 'sha1'])) {
+                $this->addFinding('Sensitive Data Exposure (Weak Hashing)', $node->getStartLine(), 'MEDIUM');
             }
         }
 
-        // 3. فحص ثغرة الـ XSS (عبر الـ Echo والـ Print البنيوية وليست دالة عادية)
-        if ($this->mode === 'xss' && ($node instanceof Node\Stmt\Echo_ || $node instanceof Node\Expr\Print_)) {
-            $exprs = $node instanceof Node\Stmt\Echo_ ? $node->exprs : [$node->expr];
-            foreach ($exprs as $expr) {
-                if ($this->isNodeTainted($expr)) {
-                    $this->findings[] = [
-                        'type' => 'XSS',
-                        'line' => $node->getStartLine(),
-                        'severity' => 'HIGH'
-                    ];
-                    break;
+        // فحص الـ PDO (SQLi)
+        if ($node instanceof Node\Expr\MethodCall && $node->name instanceof Node\Identifier) {
+            if ($this->mode === 'sql' && in_array($node->name->toString(), ['query', 'exec', 'prepare', 'execute'])) {
+                if ($this->isNodeTainted($node->args[0]->value)) $this->addFinding('SQL Injection (PDO)', $node->getStartLine(), 'CRITICAL');
+            }
+        }
+
+        // XSS (Echo / Print / Short Tags)
+        if ($this->mode === 'xss') {
+            if ($node instanceof Node\Stmt\Echo_ || $node instanceof Node\Expr\Print_) {
+                $exprs = $node instanceof Node\Stmt\Echo_ ? $node->exprs : [$node->expr];
+                foreach ($exprs as $expr) {
+                    if ($this->isNodeTainted($expr)) $this->addFinding('Cross-Site Scripting (XSS)', $node->getStartLine(), 'HIGH');
+                }
+            }
+            if ($node instanceof Node\Stmt\InlineHTML && strpos($node->value, '<?=') !== false) {
+                if (strpos($node->value, '_GET') !== false || strpos($node->value, '_POST') !== false) {
+                    $this->addFinding('Cross-Site Scripting (XSS Short Tag)', $node->getStartLine(), 'HIGH');
                 }
             }
         }
+    }
+
+    public function afterTraverse(array $nodes) {
+        if ($this->mode === 'csrf' && !$this->hasCsrfCheck) {
+            $this->addFinding('Missing CSRF Protection', 1, 'HIGH');
+        }
+    }
+
+    private function addFinding($type, $line, $severity) {
+        $this->findings[] = ['vulnerability' => $type, 'line' => $line, 'severity' => $severity];
     }
 }
 
-// الدالة الأساسية للمحرك
-function phpAnalyze($code, $mode) {
-    // تصحيح الكود لو اليوزر مبعتش علامة الـ <?php عشان البارسر ميضربش
-    if (strpos($code, '<?php') === false) {
-        $code = '<?php ' . $code;
-    }
+class AwareXPHPAnalyzer {
+    private $parser;
+    public function __construct() { $this->parser = (new ParserFactory())->createForNewerVersion(); }
 
-    $parser = (new ParserFactory())->create(ParserFactory::PREFER_PHP7);
-    try {
-        $ast = $parser->parse($code);
-    } catch (\Exception $error) {
-        return [];
-    }
+    // 🔥 الدالة المطلوبة: تستقبل كود اليوزر ونوع الثغرة ديناميكياً
+    public function analyze($userCode, $userMode) {
+        try {
+            $ast = $this->parser->parse($userCode);
+            if ($ast === null) return ['status' => 'success', 'total_findings' => 0, 'findings' => []];
 
-    $availableModes = ['sql', 'xss', 'command'];
-    $allFindings = [];
-
-    if ($mode === 'all') {
-        foreach ($availableModes as $m) {
             $traverser = new NodeTraverser();
-            $visitor = new SecurityTaintVisitor($m);
+            $visitor = new SecurityTaintVisitor(strtolower(trim($userMode)));
             $traverser->addVisitor($visitor);
             $traverser->traverse($ast);
-            $allFindings = array_merge($allFindings, $visitor->findings);
-        }
-    } else {
-        $traverser = new NodeTraverser();
-        $visitor = new SecurityTaintVisitor($mode);
-        $traverser->addVisitor($visitor);
-        $traverser->traverse($ast);
-        $allFindings = $visitor->findings;
-    }
 
-    // تنظيف النتائج وإزالة أي تكرار
-    $uniqueFindings = [];
-    foreach ($allFindings as $f) {
-        $key = $f['type'] . '_' . $f['line'];
-        if (!isset($uniqueFindings[$key])) {
-            $uniqueFindings[$key] = $f;
+            return ['status' => 'success', 'mode' => $userMode, 'total_findings' => count($visitor->findings), 'findings' => $visitor->findings];
+        } catch (Error $error) {
+            return ['status' => 'error', 'message' => $error->getMessage()];
         }
     }
-
-    usort($uniqueFindings, function($a, $b) { return $a['line'] - $b['line']; });
-    return array_values($uniqueFindings);
-}
-
-// دالة الفورمات السحرية لإخراج الـ Single Quotes بالملّي
-function formatPhpOutput($findings) {
-    if (empty($findings)) return "[]";
-
-    $output = "[\n";
-    foreach ($findings as $index => $item) {
-        $output .= "    {\n";
-        $output .= "        'type': '" . $item['type'] . "',\n";
-        $output .= "        'line': " . $item['line'] . ",\n";
-        $output .= "        'severity': '" . $item['severity'] . "'\n";
-        $output .= "    }";
-        if ($index < count($findings) - 1) {
-            $output .= ",\n";
-        } else {
-            $output .= "\n";
-        }
-    }
-    $output .= "]";
-    return $output;
 }

@@ -1,192 +1,158 @@
-const express = require("express");
 const esprima = require("esprima");
-const app = express();
 
-app.use(express.json());
-
-// مصفوفة بكل الأنواع المتاحة للفحص عند اختيار "Select All" أو وضع "all"
-const AVAILABLE_MODES = ["sql", "xss", "cmd", "exposure", "csrf"];
-
-// دالة تحويل المخرجات للشكل الصارم المطلوب من تيم السيكيورتي (علامات تنصيص مفردة ومسافات دقيقة)
-function formatOutput(findings) {
-  if (findings.length === 0) return "[]";
-
-  const formattedObjects = findings.map(item => {
-    return `    {\n        'type': '${item.type}',\n        'line': ${item.line},\n        'severity': '${item.severity}'\n    }`;
-  });
-
-  return `[\n${formattedObjects.join(",\n")}\n]`;
-}
-
-function analysis(code, requestedMode) {
-  let tree;
-  try {
-    tree = esprima.parseScript(code, { loc: true });
-  } catch (e) {
-    return [{ error: "Syntax Error in code" }]; 
+class AwareXNodeAnalyzer {
+  constructor() {
+    this.findings = [];
+    this.taintedVars = new Set();
+    this.hasCsrfMiddleware = false;
+    this.mode = "";
   }
 
-  let findings = [];
-  let taintedVariables = new Set();
-  let hasCsrfProtection = false;
-  const sensitivePatterns = /password|pass|secret|token|key/i;
-
-  const sinks = {
-    sql: ["execute", "query", "run", "db.query"],
-    xss: ["write", "innerHTML", "send", "render"],
-    cmd: ["exec", "spawn", "system"],
-    exposure: ["log", "print", "warn", "console.log"],
-  };
-
-  const codeString = code.toLowerCase();
-  if (codeString.includes("csurf") || codeString.includes("csrf") || codeString.includes("antiforgery")) {
-    hasCsrfProtection = true;
-  }
-
-  function isNodeTainted(node) {
+  isNodeTainted(node) {
     if (!node) return false;
-    if (node.type === "Identifier") return taintedVariables.has(node.name);
-    
-    if (node.type === "BinaryExpression") {
-      return isNodeTainted(node.left) || isNodeTainted(node.right);
-    }
-    
     if (node.type === "MemberExpression") {
-      const fullPath = getMemberExpressionPath(node);
-      if (fullPath.startsWith("req.body") || fullPath.startsWith("req.query") || fullPath.startsWith("req.params")) {
+      let obj = node.object;
+      if (obj.type === "MemberExpression" && obj.object.name === "req") {
+        if (["body", "query", "params", "headers"].includes(obj.property.name))
+          return true;
+      }
+      if (
+        obj.name === "req" &&
+        ["body", "query", "params"].includes(node.property.name)
+      )
         return true;
-      }
-      if (node.object && node.object.type === "Identifier") {
-        return taintedVariables.has(node.object.name);
-      }
     }
-
-    if (node.type === "CallExpression") {
-      const name = getMethodName(node);
-      if (name === "input") return true;
-      return node.arguments.some((arg) => isNodeTainted(arg));
+    if (node.type === "Identifier" && this.taintedVars.has(node.name))
+      return true;
+    if (node.type === "BinaryExpression" && node.operator === "+")
+      return this.isNodeTainted(node.left) || this.isNodeTainted(node.right);
+    if (node.type === "TemplateLiteral") {
+      for (let expr of node.expressions) {
+        if (this.isNodeTainted(expr)) return true;
+      }
     }
     return false;
   }
 
-  function getMemberExpressionPath(node) {
-    if (node.type === "Identifier") return node.name;
-    if (node.type === "MemberExpression") {
-      const obj = getMemberExpressionPath(node.object);
-      const prop = node.computed ? "[]" : (node.property.name || "");
-      return obj ? `${obj}.${prop}` : prop;
-    }
-    return "";
-  }
-
-  function getMethodName(node) {
-    if (node.callee.type === "Identifier") return node.callee.name;
-    if (node.callee.type === "MemberExpression") {
-      const fullPath = getMemberExpressionPath(node.callee);
-      if (sinks.sql.includes(fullPath) || sinks.exposure.includes(fullPath)) return fullPath;
-      return node.callee.property.name || "";
-    }
-    return "";
-  }
-
-  function walk(node) {
+  traverse(node) {
     if (!node) return;
 
+    // تتبع التلوث والـ Destructuring القوي
     if (node.type === "VariableDeclarator" && node.init) {
-      if (isNodeTainted(node.init) && node.id.type === "Identifier") {
-        taintedVariables.add(node.id.name);
+      if (node.id.type === "Identifier" && this.isNodeTainted(node.init))
+        this.taintedVars.add(node.id.name);
+      if (node.id.type === "ObjectPattern" && this.isNodeTainted(node.init)) {
+        node.id.properties.forEach((prop) => {
+          if (prop.value && prop.value.type === "Identifier")
+            this.taintedVars.add(prop.value.name);
+        });
       }
     }
 
-    if (node.type === "AssignmentExpression") {
-      if (node.left.type === "Identifier" && isNodeTainted(node.right)) {
-        taintedVariables.add(node.left.name);
-      }
+    // كشف ميديالوير الـ CSRF
+    if (
+      node.type === "CallExpression" &&
+      node.callee.name === "app" &&
+      node.callee.property?.name === "use"
+    ) {
+      let arg = node.arguments[0];
+      if (
+        arg &&
+        (arg.name?.toLowerCase().includes("csrf") ||
+          arg.callee?.name?.toLowerCase().includes("csrf"))
+      )
+        this.hasCsrfMiddleware = true;
     }
 
+    // فحص الـ Sinks والـ Functions
     if (node.type === "CallExpression") {
-      const methodName = getMethodName(node);
-      
-      function checkVulnerability(currentMode) {
-        if (sinks[currentMode] && sinks[currentMode].includes(methodName)) {
-          if (currentMode === "sql" && node.arguments.length > 1) return; 
+      let funcName =
+        node.callee.type === "Identifier"
+          ? node.callee.name
+          : node.callee.property?.name;
 
-          if (node.arguments.some((arg) => isNodeTainted(arg))) {
-            findings.push({
-              type: currentMode === "sql" ? "SQL Injection" : currentMode === "xss" ? "XSS" : "Command Injection",
-              line: node.loc ? node.loc.start.line : "Unknown",
-              severity: "HIGH",
-            });
-          }
-        }
-
-        if (currentMode === "exposure" && sinks["exposure"].includes(methodName)) {
-          let isSensitive = node.arguments.some((arg) => {
-            if (arg.type === "Identifier") return sensitivePatterns.test(arg.name);
-            if (arg.type === "MemberExpression") return sensitivePatterns.test(getMemberExpressionPath(arg));
-            return false;
-          });
-          if (isSensitive) {
-            findings.push({
-              type: "Data Exposure",
-              line: node.loc ? node.loc.start.line : "Unknown",
-              severity: "MEDIUM",
-            });
-          }
-        }
-
-        if (currentMode === "csrf" && (methodName === "post" || methodName === "put")) {
-          if (!hasCsrfProtection) {
-            findings.push({
-              type: "CSRF (Missing Protection)",
-              line: node.loc ? node.loc.start.line : "Unknown",
-              severity: "HIGH",
-            });
+      if (
+        this.mode === "sql" &&
+        ["query", "execute", "raw"].includes(funcName)
+      ) {
+        if (this.isNodeTainted(node.arguments[0]))
+          this.addFinding(
+            "SQL Injection",
+            node.loc?.start.line || 0,
+            "CRITICAL",
+          );
+      }
+      if (
+        this.mode === "command" &&
+        ["exec", "execSync", "spawn", "spawnSync"].includes(funcName)
+      ) {
+        if (this.isNodeTainted(node.arguments[0]))
+          this.addFinding(
+            "Command Injection",
+            node.loc?.start.line || 0,
+            "CRITICAL",
+          );
+      }
+      if (
+        this.mode === "xss" &&
+        ["send", "write", "render"].includes(funcName)
+      ) {
+        for (let arg of node.arguments) {
+          if (this.isNodeTainted(arg)) {
+            this.addFinding(
+              "Cross-Site Scripting (XSS)",
+              node.loc?.start.line || 0,
+              "HIGH",
+            );
+            break;
           }
         }
       }
-
-      if (requestedMode === "all") {
-        AVAILABLE_MODES.forEach(mode => checkVulnerability(mode));
-      } else {
-        checkVulnerability(requestedMode);
+      if (this.mode === "exposure" && funcName === "createHash") {
+        if (
+          node.arguments[0] &&
+          ["md5", "sha1"].includes(node.arguments[0].value)
+        )
+          this.addFinding(
+            "Sensitive Data Exposure (Weak Hashing)",
+            node.loc?.start.line || 0,
+            "MEDIUM",
+          );
       }
     }
 
     for (let key in node) {
-      if (node.hasOwnProperty(key)) {
-        if (typeof node[key] === "object" && node[key] !== null) {
-          if (Array.isArray(node[key])) {
-            node[key].forEach(child => walk(child));
-          } else {
-            walk(node[key]);
-          }
-        }
+      if (node[key] && typeof node[key] === "object") {
+        if (Array.isArray(node[key]))
+          node[key].forEach((child) => this.traverse(child));
+        else this.traverse(node[key]);
       }
     }
   }
 
-  walk(tree);
-  return findings.filter((v, i, a) => a.findIndex(t => (t.type === v.type && t.line === v.line)) === i);
-}
-
-// الـ Endpoint المطلوبة للفرونت والباك
-app.post("/analyze", (req, res) => {
-  const { lan, code, vuln } = req.body;
-
-  if (lan !== "node" && lan !== "javascript") {
-    return res.status(400).json({ error: "This endpoint only supports Node.js/Javascript" });
+  addFinding(type, line, severity) {
+    this.findings.push({ vulnerability: type, line: line, severity: severity });
   }
 
-  // تشغيل الفحص (vuln ممكن تكون اسم ثغرة محددة أو "all")
-  const rawResults = analysis(code, vuln);
-
-  // تحويل النتيجة للشكل الصارم المطلوب بالـ Single Quotes
-  const finalResponseString = formatOutput(rawResults);
-
-  // إرسال الرد كنص مفرمت يحافظ على شكل الأقواس وعلامات التنصيص
-  res.setHeader("Content-Type", "text/plain");
-  return res.send(finalResponseString);
-});
-
-app.listen(3000, () => console.log("Node.js Code Review Service running on port 3000"));
+  // 🔥 الدالة المطلوبة: تستقبل كود اليوزر ونوع الثغرة ديناميكياً
+  analyze(userCode, userMode) {
+    this.findings = [];
+    this.taintedVars.clear();
+    this.hasCsrfMiddleware = false;
+    this.mode = userMode.toLowerCase().trim();
+    try {
+      const ast = esprima.parseScript(userCode, { loc: true });
+      this.traverse(ast);
+      if (this.mode === "csrf" && !this.hasCsrfMiddleware)
+        this.addFinding("Missing CSRF Middleware Protection", 1, "HIGH");
+      return {
+        status: "success",
+        mode: this.mode,
+        total_findings: this.findings.length,
+        findings: this.findings,
+      };
+    } catch (err) {
+      return { status: "error", message: err.message };
+    }
+  }
+}
