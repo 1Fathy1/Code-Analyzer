@@ -1,24 +1,25 @@
-// كود ملف test.js
-async function testScanner() {
-    const response = await fetch("http://localhost:3000/analyze", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-            lan: "node",
-            vuln: "all", // جربيها "sql" أو "all" للـ Select All
-            code: `
-                const data = input();
-                db.query(data);
-                
-                console.log(secret_token);
-            `
-        })
-    });
+const requestData = {
+  lan: "javascript",               
+  vuln: "all",                     
+  code: "const data = req.query.id; db.query(data);" 
+};
 
-    const result = await response.json();
-    console.log("🎯 النتيجة من الـ Scanner API:\n", JSON.stringify(result, null, 2));
-}
-
-testScanner();
+fetch("http://localhost:3000/analyze", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify(requestData)
+})
+// 👇 التعديل هنا: بنستقبله كنص صريح (Text) مش JSON
+.then(response => response.text()) 
+.then(findingsText => {
+  // هنا الـ findingsText هيرجع عبارة عن String متفرمت بالـ Single Quotes بالظبط
+  console.log("check result: \n", findingsText);
+  
+  // لما تيجي تعرضيه في الفرونت إند جوه كارت أو الـ UI 
+  // هتحطيه جوه تاج <pre><code> عشان يحافظ على المسافات والأسطر
+  // مثلاً لو بتستخدمي React أو JS عادية:
+  // myDOMElement.innerText = findingsText;
+})
+.catch(error => console.error("Error:", error));

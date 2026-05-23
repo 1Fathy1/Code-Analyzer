@@ -4,15 +4,26 @@ const app = express();
 
 app.use(express.json());
 
-// مصفوفة بكل الأنواع المتاحة للفحص عند اختيار "Select All"
+// مصفوفة بكل الأنواع المتاحة للفحص عند اختيار "Select All" أو وضع "all"
 const AVAILABLE_MODES = ["sql", "xss", "cmd", "exposure", "csrf"];
 
-function analysis(code, mode) {
+// دالة تحويل المخرجات للشكل الصارم المطلوب من تيم السيكيورتي (علامات تنصيص مفردة ومسافات دقيقة)
+function formatOutput(findings) {
+  if (findings.length === 0) return "[]";
+
+  const formattedObjects = findings.map(item => {
+    return `    {\n        'type': '${item.type}',\n        'line': ${item.line},\n        'severity': '${item.severity}'\n    }`;
+  });
+
+  return `[\n${formattedObjects.join(",\n")}\n]`;
+}
+
+function analysis(code, requestedMode) {
   let tree;
   try {
     tree = esprima.parseScript(code, { loc: true });
   } catch (e) {
-    return []; // كود غير صحيح قواعدياً
+    return [{ error: "Syntax Error in code" }]; 
   }
 
   let findings = [];
@@ -21,10 +32,10 @@ function analysis(code, mode) {
   const sensitivePatterns = /password|pass|secret|token|key/i;
 
   const sinks = {
-    sql: ["execute", "query", "run"],
+    sql: ["execute", "query", "run", "db.query"],
     xss: ["write", "innerHTML", "send", "render"],
     cmd: ["exec", "spawn", "system"],
-    exposure: ["log", "print", "warn"],
+    exposure: ["log", "print", "warn", "console.log"],
   };
 
   const codeString = code.toLowerCase();
@@ -32,79 +43,131 @@ function analysis(code, mode) {
     hasCsrfProtection = true;
   }
 
-  // دالة مساعدة لتتبع التلوث
   function isNodeTainted(node) {
     if (!node) return false;
     if (node.type === "Identifier") return taintedVariables.has(node.name);
+    
     if (node.type === "BinaryExpression") {
       return isNodeTainted(node.left) || isNodeTainted(node.right);
     }
+    
+    if (node.type === "MemberExpression") {
+      const fullPath = getMemberExpressionPath(node);
+      if (fullPath.startsWith("req.body") || fullPath.startsWith("req.query") || fullPath.startsWith("req.params")) {
+        return true;
+      }
+      if (node.object && node.object.type === "Identifier") {
+        return taintedVariables.has(node.object.name);
+      }
+    }
+
     if (node.type === "CallExpression") {
-      const name = node.callee.name || (node.callee.property ? node.callee.property.name : "");
-      if (name === "input" || name === "req.body" || name === "req.query") return true;
+      const name = getMethodName(node);
+      if (name === "input") return true;
       return node.arguments.some((arg) => isNodeTainted(arg));
     }
     return false;
   }
 
-  // الفحص العابر للـ AST
-  tree.body.forEach((node) => {
-    if (node.type === "ExpressionStatement" && node.expression.type === "AssignmentExpression") {
-      const assign = node.expression;
-      if (assign.left.type === "Identifier") {
-        if (isNodeTainted(assign.right)) {
-          taintedVariables.add(assign.left.name);
-        }
+  function getMemberExpressionPath(node) {
+    if (node.type === "Identifier") return node.name;
+    if (node.type === "MemberExpression") {
+      const obj = getMemberExpressionPath(node.object);
+      const prop = node.computed ? "[]" : (node.property.name || "");
+      return obj ? `${obj}.${prop}` : prop;
+    }
+    return "";
+  }
+
+  function getMethodName(node) {
+    if (node.callee.type === "Identifier") return node.callee.name;
+    if (node.callee.type === "MemberExpression") {
+      const fullPath = getMemberExpressionPath(node.callee);
+      if (sinks.sql.includes(fullPath) || sinks.exposure.includes(fullPath)) return fullPath;
+      return node.callee.property.name || "";
+    }
+    return "";
+  }
+
+  function walk(node) {
+    if (!node) return;
+
+    if (node.type === "VariableDeclarator" && node.init) {
+      if (isNodeTainted(node.init) && node.id.type === "Identifier") {
+        taintedVariables.add(node.id.name);
       }
     }
 
-    if (node.type === "ExpressionStatement" && node.expression.type === "CallExpression") {
-      const call = node.expression;
-      const methodName = call.callee.name || (call.callee.property ? call.callee.property.name : "");
+    if (node.type === "AssignmentExpression") {
+      if (node.left.type === "Identifier" && isNodeTainted(node.right)) {
+        taintedVariables.add(node.left.name);
+      }
+    }
 
-      // 1. SQL, XSS, CMD
-      if (sinks[mode] && sinks[mode].includes(methodName)) {
-        if (mode === "sql" && call.arguments.length > 1) return; // Parameterized = safe
+    if (node.type === "CallExpression") {
+      const methodName = getMethodName(node);
+      
+      function checkVulnerability(currentMode) {
+        if (sinks[currentMode] && sinks[currentMode].includes(methodName)) {
+          if (currentMode === "sql" && node.arguments.length > 1) return; 
 
-        let isVulnerable = call.arguments.some((arg) => isNodeTainted(arg));
-        if (isVulnerable) {
-          findings.push({
-            type: mode === "sql" ? "SQL Injection" : mode === "xss" ? "XSS" : "Command Injection",
-            line: node.loc.start.line,
-            severity: "HIGH",
+          if (node.arguments.some((arg) => isNodeTainted(arg))) {
+            findings.push({
+              type: currentMode === "sql" ? "SQL Injection" : currentMode === "xss" ? "XSS" : "Command Injection",
+              line: node.loc ? node.loc.start.line : "Unknown",
+              severity: "HIGH",
+            });
+          }
+        }
+
+        if (currentMode === "exposure" && sinks["exposure"].includes(methodName)) {
+          let isSensitive = node.arguments.some((arg) => {
+            if (arg.type === "Identifier") return sensitivePatterns.test(arg.name);
+            if (arg.type === "MemberExpression") return sensitivePatterns.test(getMemberExpressionPath(arg));
+            return false;
           });
+          if (isSensitive) {
+            findings.push({
+              type: "Data Exposure",
+              line: node.loc ? node.loc.start.line : "Unknown",
+              severity: "MEDIUM",
+            });
+          }
+        }
+
+        if (currentMode === "csrf" && (methodName === "post" || methodName === "put")) {
+          if (!hasCsrfProtection) {
+            findings.push({
+              type: "CSRF (Missing Protection)",
+              line: node.loc ? node.loc.start.line : "Unknown",
+              severity: "HIGH",
+            });
+          }
         }
       }
 
-      // 2. Data Exposure
-      if (mode === "exposure" && sinks["exposure"].includes(methodName)) {
-        let isSensitive = call.arguments.some((arg) => {
-          if (arg.type === "Identifier") return sensitivePatterns.test(arg.name);
-          return false;
-        });
-        if (isSensitive) {
-          findings.push({
-            type: "Data Exposure",
-            line: node.loc.start.line,
-            severity: "MEDIUM",
-          });
-        }
+      if (requestedMode === "all") {
+        AVAILABLE_MODES.forEach(mode => checkVulnerability(mode));
+      } else {
+        checkVulnerability(requestedMode);
       }
+    }
 
-      // 3. CSRF
-      if (mode === "csrf" && (methodName === "post" || methodName === "put")) {
-        if (!hasCsrfProtection) {
-          findings.push({
-            type: "CSRF (Missing Protection)",
-            line: node.loc.start.line,
-            severity: "HIGH",
-          });
+    for (let key in node) {
+      if (node.hasOwnProperty(key)) {
+        if (typeof node[key] === "object" && node[key] !== null) {
+          if (Array.isArray(node[key])) {
+            node[key].forEach(child => walk(child));
+          } else {
+            walk(node[key]);
+          }
         }
       }
     }
-  });
+  }
 
-  return findings;
+  walk(tree);
+  return findings.filter((v, i, a) => a.findIndex(t => (t.type === v.type && t.line === v.line)) === i);
 }
 
 // الـ Endpoint المطلوبة للفرونت والباك
@@ -115,20 +178,15 @@ app.post("/analyze", (req, res) => {
     return res.status(400).json({ error: "This endpoint only supports Node.js/Javascript" });
   }
 
-  let finalResults = [];
+  // تشغيل الفحص (vuln ممكن تكون اسم ثغرة محددة أو "all")
+  const rawResults = analysis(code, vuln);
 
-  // التعديل الذكي لدعم الـ Select All وثغرة معينة في نفس الوقت
-  if (vuln === "all") {
-    // لو اختار Select All بنلف على كل المودز ونجمع النتائج
-    AVAILABLE_MODES.forEach((mode) => {
-      finalResults = finalResults.concat(analysis(code, mode));
-    });
-  } else {
-    // لو اختار ثغرة واحدة معينة بنشغل الـ analysis عليها هي بس
-    finalResults = analysis(code, vuln);
-  }
+  // تحويل النتيجة للشكل الصارم المطلوب بالـ Single Quotes
+  const finalResponseString = formatOutput(rawResults);
 
-  return res.json(finalResults);
+  // إرسال الرد كنص مفرمت يحافظ على شكل الأقواس وعلامات التنصيص
+  res.setHeader("Content-Type", "text/plain");
+  return res.send(finalResponseString);
 });
 
 app.listen(3000, () => console.log("Node.js Code Review Service running on port 3000"));
