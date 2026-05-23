@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("CSharpAnalyzer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+007cfab35e0f187f0544b757962e47db0243c852")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+62ee63b7ab30be95860c796a8200c5792d47abdc")]
 [assembly: System.Reflection.AssemblyProductAttribute("CSharpAnalyzer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("CSharpAnalyzer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
