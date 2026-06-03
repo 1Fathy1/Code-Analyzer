@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from analyzer import SecurityAnalyzer
 import ast
+import os
 
 app = Flask(__name__)
 
@@ -36,7 +37,8 @@ def analyze():
             "message": str(e)
         })
 
-
-# ✅ run server
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+    )
