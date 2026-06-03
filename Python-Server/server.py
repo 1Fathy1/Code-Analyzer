@@ -14,7 +14,7 @@ def analyze_code(code, mode="all"):
 
 
 # ✅ API endpoint
-@app.route("/analyze", methods=["POST"])
+@app.route("/api/v1/py/analyze", methods=["POST"])
 def analyze():
 
     data = request.json
