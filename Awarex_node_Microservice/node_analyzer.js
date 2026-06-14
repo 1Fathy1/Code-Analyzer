@@ -1,6 +1,6 @@
-const express = require('express');
-const cors = require('cors');
-const esprima = require('esprima');
+const express = require("express");
+const cors = require("cors");
+const esprima = require("esprima");
 
 const app = express();
 const PORT = 4000; // السيرفر هيشتغل على بورت 4000
@@ -151,7 +151,7 @@ class AwareXNodeAnalyzer {
       this.traverse(ast);
       if (this.mode === "csrf" && !this.hasCsrfMiddleware)
         this.addFinding("Missing CSRF Middleware Protection", 1, "HIGH");
-      
+
       return {
         status: "success",
         vulnerabilities: this.findings,
@@ -162,21 +162,28 @@ class AwareXNodeAnalyzer {
   }
 }
 
-// 🌐 الـ Endpoint اللي تيم الباك إند هيستدعيها
-app.post('/api/analyze/node', (req, res) => {
-    const { code, mode } = req.body;
+// 🌐 الـ Endpoint بالتعديل المطلوب لاستقبال code و vuln وتمريرها للـ analyzer
+app.post("/api/analyze/node", (req, res) => {
+  const { code, vuln, lan } = req.body;
 
-    if (!code || !mode) {
-        return res.status(400).json({ status: "error", message: "المعاملات المرسلة (code أو mode) ناقصة!" });
-    }
+  if (!code || !vuln) {
+    return res
+      .status(400)
+      .json({
+        status: "error",
+        message: "المعاملات المرسلة (code أو vuln) ناقصة!",
+      });
+  }
 
-    const analyzer = new AwareXNodeAnalyzer();
-    const result = analyzer.analyze(code, mode);
+  const analyzer = new AwareXNodeAnalyzer();
+  const result = analyzer.analyze(code, vuln);
 
-    return res.json(result);
+  return res.json(result);
 });
 
 // تشغيل السيرفر
 app.listen(PORT, () => {
-    console.log(`🚀 Node.js Analyzer Microservice is running on: http://localhost:${PORT}`);
+  console.log(
+    `🚀 Node.js Analyzer Microservice is running on: http://localhost:${PORT}`,
+  );
 });
